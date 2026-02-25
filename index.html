@@ -275,6 +275,10 @@
         <div class="request-title">Request Body</div>
         <div class="request-body" id="requestBody"></div>
       </div>
+      <div class="request-box" id="responseBox">
+        <div class="request-title">Response Body</div>
+        <div class="request-body" id="responseBody"></div>
+      </div>
     </div>
 
     <!-- Claude panel -->
@@ -298,6 +302,10 @@
       <div class="request-box" id="claudeRequestBox">
         <div class="request-title">Request Body</div>
         <div class="request-body" id="claudeRequestBody"></div>
+      </div>
+      <div class="request-box" id="claudeResponseBox">
+        <div class="request-title">Response Body</div>
+        <div class="request-body" id="claudeResponseBody"></div>
       </div>
     </div>
   </div>
@@ -379,8 +387,8 @@
         let buffer = '';
         const citations = [];
         const seen = new Set();
-        // track block name by index (for server_tool_use)
         const blockNames = {};
+        const allEvents = [];
 
         const addCitation = (url, title) => {
           if (url && !seen.has(url)) { seen.add(url); citations.push({ url, title: title || url }); }
@@ -399,6 +407,7 @@
             const raw = line.slice(6).trim();
             let evt;
             try { evt = JSON.parse(raw); } catch { continue; }
+            allEvents.push(evt);
 
             const type = evt.type || '';
 
@@ -450,6 +459,10 @@
         }
 
         status.textContent = `完成 · 模型: ${finalModel}`;
+
+        const claudeResponseBox = document.getElementById('claudeResponseBox');
+        document.getElementById('claudeResponseBody').textContent = JSON.stringify(allEvents, null, 2);
+        claudeResponseBox.className = 'request-box visible';
 
       } catch (err) {
         showClaudeError(err.message);
@@ -558,6 +571,8 @@
             if (type === 'response.completed') {
               const resp = evt.response || {};
               finalModel = resp.model || finalModel;
+              document.getElementById('responseBody').textContent = JSON.stringify(resp, null, 2);
+              document.getElementById('responseBox').className = 'request-box visible';
               const citations = [];
               const seen = new Set();
               const queries = [];
