@@ -251,7 +251,7 @@
     <div class="tabs">
       <button class="tab active" id="tab-openai" onclick="switchTab('openai')">OpenAI <span class="model-badge" style="margin-left:6px">gpt-5-nano</span></button>
       <button class="tab" id="tab-claude" onclick="switchTab('claude')">Claude <span class="model-badge" style="margin-left:6px;background:#1e2d3d;color:#7ab8f5">claude-haiku-4-5-20251001</span></button>
-      <button class="tab" id="tab-openai-mcp" onclick="switchTab('openai-mcp')">MCP <span class="model-badge" style="margin-left:6px;background:#2d2a1e;color:#d8c77a">gpt-5-nano</span></button>
+      <button class="tab" id="tab-openai-mcp" onclick="switchTab('openai-mcp')">MCP <span class="model-badge" style="margin-left:6px;background:#2d2a1e;color:#d8c77a">claude-haiku-4-5-20251001</span></button>
     </div>
 
     <!-- OpenAI panel -->
@@ -317,7 +317,7 @@
         <textarea id="mcpQuery" placeholder="例如：今天有什么科技新闻？"></textarea>
       </div>
       <div style="display:flex; gap:12px; align-items:center; margin-bottom:8px;">
-        <button id="mcpSearchBtn" onclick="doOpenAIMcpSearch()">搜索</button>
+        <button id="mcpSearchBtn" onclick="doMcpSearch()">搜索</button>
         <div class="status" id="mcpStatus"></div>
       </div>
       <div class="error-box" id="mcpErrorBox"></div>
@@ -496,12 +496,14 @@
       return payload.result;
     }
 
-    async function callResponsesApiStream(baseUrl, apiKey, body, onEvent) {
-      const res = await fetch(`${baseUrl}/v1/responses`, {
+    async function callAnthropicMessagesApiStream(baseUrl, apiKey, body, onEvent) {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {})
+          ...(apiKey ? { 'x-api-key': apiKey } : {}),
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05'
         },
         body: JSON.stringify(body)
       });
@@ -512,13 +514,39 @@
       }
 
       const reader = res.body?.getReader?.();
-      if (!reader) {
-        throw new Error('流式响应不可用');
-      }
+      if (!reader) throw new Error('流式响应不可用');
 
       const decoder = new TextDecoder();
       let buffer = '';
-      let completedResponse = null;
+      let finalModel = body.model || '';
+      const allEvents = [];
+      const openBlocks = {};
+      const closedBlocks = {};
+
+      const finalizeBlock = (idx) => {
+        const current = openBlocks[idx];
+        if (!current) return;
+        if (current.type === 'tool_use') {
+          let input = current.input && typeof current.input === 'object' ? current.input : {};
+          const partial = current.partial || '';
+          if (partial.trim()) {
+            const parsed = safeJsonParse(partial, null) || safeJsonParse(`{${partial}}`, null);
+            if (parsed && typeof parsed === 'object') input = parsed;
+          }
+          closedBlocks[idx] = {
+            type: 'tool_use',
+            id: current.id || `toolu_${idx}_${Date.now()}`,
+            name: current.name || '',
+            input
+          };
+        } else if (current.type === 'text') {
+          closedBlocks[idx] = {
+            type: 'text',
+            text: current.text || ''
+          };
+        }
+        delete openBlocks[idx];
+      };
 
       while (true) {
         const { done, value } = await reader.read();
@@ -535,20 +563,56 @@
 
           let evt;
           try { evt = JSON.parse(raw); } catch { continue; }
+          allEvents.push(evt);
           if (onEvent) onEvent(evt);
 
-          if (evt.type === 'response.completed') {
-            completedResponse = evt.response || completedResponse;
-          } else if (evt.type === 'response.failed') {
-            throw new Error(evt.response?.error?.message || '响应失败');
+          const type = evt.type || '';
+          if (type === 'message_start') {
+            finalModel = evt.message?.model || finalModel;
+          } else if (type === 'error') {
+            throw new Error(evt.error?.message || '消息流返回错误');
+          } else if (type === 'content_block_start') {
+            const idx = evt.index;
+            const block = evt.content_block || {};
+            if (block.type === 'text') {
+              openBlocks[idx] = { type: 'text', text: block.text || '' };
+            } else if (block.type === 'tool_use') {
+              openBlocks[idx] = {
+                type: 'tool_use',
+                id: block.id,
+                name: block.name,
+                input: (block.input && typeof block.input === 'object') ? block.input : {},
+                partial: ''
+              };
+            }
+          } else if (type === 'content_block_delta') {
+            const idx = evt.index;
+            const delta = evt.delta || {};
+            const current = openBlocks[idx];
+            if (!current) continue;
+
+            if (current.type === 'text' && delta.type === 'text_delta') {
+              current.text += delta.text || '';
+            } else if (
+              current.type === 'tool_use' &&
+              (delta.type === 'input_json_delta' || delta.type === 'json_delta')
+            ) {
+              current.partial += delta.partial_json || delta.json || '';
+            }
+          } else if (type === 'content_block_stop') {
+            finalizeBlock(evt.index);
           }
         }
       }
 
-      if (!completedResponse) {
-        throw new Error('流式响应未返回 response.completed');
-      }
-      return completedResponse;
+      for (const idx of Object.keys(openBlocks)) finalizeBlock(idx);
+
+      const content = Object.keys(closedBlocks)
+        .map(idx => Number(idx))
+        .sort((a, b) => a - b)
+        .map(idx => closedBlocks[idx]);
+
+      return { model: finalModel, content, events: allEvents };
     }
 
     function getDefaultMcpTools() {
@@ -596,31 +660,22 @@
       return cachedMcpTools;
     }
 
-    function buildOpenAIMcpTools(toolMap) {
+    function buildMcpClaudeTools(toolMap) {
       const defaults = getDefaultMcpTools();
       const search = toolMap.web_search || defaults.web_search;
       const fetchTool = toolMap.web_fetch || defaults.web_fetch;
       return [
         {
-          type: 'function',
           name: 'mcp_org_web_search',
           description: search.description,
-          parameters: search.inputSchema
+          input_schema: search.inputSchema
         },
         {
-          type: 'function',
           name: 'mcp_org_web_fetch',
           description: fetchTool.description,
-          parameters: fetchTool.inputSchema
+          input_schema: fetchTool.inputSchema
         }
       ];
-    }
-
-    function parseToolArgs(args) {
-      if (!args) return {};
-      if (typeof args === 'string') return safeJsonParse(args, { raw: args });
-      if (typeof args === 'object') return args;
-      return {};
     }
 
     function normalizeMcpToolArgs(aliasName, args) {
@@ -695,21 +750,7 @@
       }
     }
 
-    function getMessageItemsFromResponse(outputItems) {
-      const items = [];
-      for (const item of (outputItems || [])) {
-        if (!item || typeof item !== 'object') continue;
-        if (item.type !== 'message') continue;
-        items.push({
-          type: 'message',
-          role: item.role || 'assistant',
-          content: item.content || []
-        });
-      }
-      return items;
-    }
-
-    async function doOpenAIMcpSearch() {
+    async function doMcpSearch() {
       const query = document.getElementById('mcpQuery').value.trim();
       const btn = document.getElementById('mcpSearchBtn');
       const status = document.getElementById('mcpStatus');
@@ -737,7 +778,7 @@
       btn.disabled = true;
       status.innerHTML = '<span class="spinner"></span>连接中...';
 
-      let finalModel = 'gpt-5-nano';
+      let finalModel = 'claude-haiku-4-5-20251001';
       let finalAnswer = '';
       const requestHistory = [];
       const responseHistory = [];
@@ -745,20 +786,27 @@
       const citations = [];
       const seenCitations = new Set();
 
+      const appendAnswerChunk = (chunk) => {
+        if (!chunk) return;
+        finalAnswer += chunk;
+        renderMcpOutput(resultText, toolLogs, finalAnswer);
+      };
+
       try {
         const toolMap = await getMcpTools();
-        const openAITools = buildOpenAIMcpTools(toolMap);
-        let inputPayload = [{ role: 'user', content: query }];
+        const claudeTools = buildMcpClaudeTools(toolMap);
+        const messages = [{ role: 'user', content: query }];
         const maxRounds = 8;
 
         resultBox.className = 'result-box visible';
 
         for (let round = 1; round <= maxRounds; round++) {
           const body = {
-            model: 'gpt-5-nano',
-            tools: openAITools,
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 2048,
             stream: true,
-            input: inputPayload
+            tools: claudeTools,
+            messages
           };
 
           requestHistory.push({ round, body });
@@ -768,50 +816,57 @@
           status.innerHTML = `<span class="spinner"></span>第${round}轮处理中...`;
           let sawTextDeltaThisRound = false;
 
-          const resp = await callResponsesApiStream(baseUrl, apiKey, body, evt => {
+          const resp = await callAnthropicMessagesApiStream(baseUrl, apiKey, body, evt => {
             const type = evt.type || '';
-            if (type === 'response.output_item.added') {
-              const item = evt.item || {};
-              if (item.type === 'function_call') {
+            if (type === 'content_block_start') {
+              const block = evt.content_block || {};
+              if (block.type === 'tool_use') {
                 status.innerHTML = `<span class="spinner"></span>第${round}轮等待工具...`;
-              } else if (item.type === 'message') {
+              } else if (block.type === 'text') {
                 status.innerHTML = `<span class="spinner"></span>第${round}轮生成回答中...`;
               }
-            } else if (type === 'response.output_text.delta') {
+            } else if (type === 'content_block_delta') {
+              const delta = evt.delta || {};
+              if (delta.type !== 'text_delta') return;
               sawTextDeltaThisRound = true;
-              finalAnswer += evt.delta || '';
-              renderMcpOutput(resultText, toolLogs, finalAnswer);
+              appendAnswerChunk(delta.text || '');
             }
           });
-          responseHistory.push({ round, response: resp });
+          responseHistory.push({
+            round,
+            response: {
+              model: resp.model,
+              content: resp.content
+            },
+            events: resp.events
+          });
           document.getElementById('mcpResponseBody').textContent = JSON.stringify(responseHistory, null, 2);
           responseBox.className = 'request-box visible';
 
           finalModel = resp.model || finalModel;
-
-          collectResponseCitations(resp, citations, seenCitations);
-          const text = extractResponseText(resp);
-          if (text && !sawTextDeltaThisRound) {
-            finalAnswer = text;
-            renderMcpOutput(resultText, toolLogs, finalAnswer);
+          if (!Array.isArray(resp.content) || resp.content.length === 0) {
+            throw new Error('模型返回为空');
           }
 
-          const messageItems = getMessageItemsFromResponse(resp.output);
-          if (messageItems.length > 0) {
-            inputPayload = inputPayload.concat(messageItems);
+          messages.push({ role: 'assistant', content: resp.content });
+
+          if (!sawTextDeltaThisRound) {
+            const roundText = resp.content
+              .filter(item => item?.type === 'text')
+              .map(item => item.text || '')
+              .join('');
+            appendAnswerChunk(roundText);
           }
 
-          const functionCalls = (resp.output || []).filter(item => item.type === 'function_call');
-          if (functionCalls.length === 0) break;
+          const toolCalls = resp.content.filter(item => item?.type === 'tool_use' && item.name);
+          if (toolCalls.length === 0) break;
 
-          const toolOutputs = [];
-          const preparedCalls = functionCalls.map((call, idx) => {
-            const toolName = call.name || '';
-            const args = normalizeMcpToolArgs(toolName, parseToolArgs(call.arguments));
-            const callId = call.call_id || `call_${round}_${idx}`;
-            const argumentsText = typeof call.arguments === 'string' ? call.arguments : safeStringify(args);
+          const preparedCalls = toolCalls.map((call, idx) => {
+            const toolName = call.name;
+            const args = normalizeMcpToolArgs(toolName, call.input || {});
+            const toolUseId = call.id || `toolu_${round}_${idx}`;
             toolLogs.push({ name: toolName, args });
-            return { toolName, args, callId, argumentsText };
+            return { toolName, args, toolUseId };
           });
           renderMcpOutput(resultText, toolLogs, finalAnswer);
 
@@ -822,6 +877,7 @@
             return { ...entry, mcpResult };
           }));
 
+          const toolResults = [];
           for (const entry of callResults) {
             if (entry.toolName === 'mcp_org_web_search') {
               collectCitationsFromMcpSearch(entry.mcpResult, citations, seenCitations);
@@ -829,21 +885,18 @@
               addCitation(citations, seenCitations, entry.args.url, entry.args.url);
             }
 
-            toolOutputs.push({
-              type: 'function_call',
-              call_id: entry.callId,
-              name: entry.toolName,
-              arguments: entry.argumentsText,
-              status: 'completed'
-            });
-            toolOutputs.push({
-              type: 'function_call_output',
-              call_id: entry.callId,
-              output: safeStringify(entry.mcpResult)
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: entry.toolUseId,
+              content: safeStringify(entry.mcpResult)
             });
           }
           if (round === maxRounds) throw new Error('工具调用轮次超过上限，请缩小问题后重试');
-          inputPayload = inputPayload.concat(toolOutputs);
+
+          messages.push({
+            role: 'user',
+            content: toolResults
+          });
         }
         renderMcpOutput(resultText, toolLogs, finalAnswer);
 
@@ -1154,7 +1207,7 @@
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doSearch();
     });
     document.getElementById('mcpQuery').addEventListener('keydown', e => {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doOpenAIMcpSearch();
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doMcpSearch();
     });
     document.getElementById('claudeQuery').addEventListener('keydown', e => {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doClaudeSearch();
