@@ -251,6 +251,7 @@
     <div class="tabs">
       <button class="tab active" id="tab-openai" onclick="switchTab('openai')">OpenAI <span class="model-badge" style="margin-left:6px">gpt-5-nano</span></button>
       <button class="tab" id="tab-claude" onclick="switchTab('claude')">Claude <span class="model-badge" style="margin-left:6px;background:#1e2d3d;color:#7ab8f5">claude-haiku-4-5-20251001</span></button>
+      <button class="tab" id="tab-openai-mcp" onclick="switchTab('openai-mcp')">MCP <span class="model-badge" style="margin-left:6px;background:#2d2a1e;color:#d8c77a">gpt-5-nano</span></button>
     </div>
 
     <!-- OpenAI panel -->
@@ -308,14 +309,559 @@
         <div class="request-body" id="claudeResponseBody"></div>
       </div>
     </div>
+
+    <!-- OpenAI MCP panel -->
+    <div id="panel-openai-mcp" style="display:none">
+      <div class="field">
+        <label>搜索问题</label>
+        <textarea id="mcpQuery" placeholder="例如：今天有什么科技新闻？"></textarea>
+      </div>
+      <div style="display:flex; gap:12px; align-items:center; margin-bottom:8px;">
+        <button id="mcpSearchBtn" onclick="doOpenAIMcpSearch()">搜索</button>
+        <div class="status" id="mcpStatus"></div>
+      </div>
+      <div class="error-box" id="mcpErrorBox"></div>
+      <div class="result-box" id="mcpResultBox">
+        <div class="result-text" id="mcpResultText"></div>
+        <div class="citations" id="mcpCitations" style="display:none">
+          <div class="citations-title">来源</div>
+          <div id="mcpCitationList"></div>
+        </div>
+      </div>
+      <div class="request-box" id="mcpRequestBox">
+        <div class="request-title">Request Body</div>
+        <div class="request-body" id="mcpRequestBody"></div>
+      </div>
+      <div class="request-box" id="mcpResponseBox">
+        <div class="request-title">Response Body</div>
+        <div class="request-body" id="mcpResponseBody"></div>
+      </div>
+    </div>
   </div>
 
   <script>
+    const MCP_ENDPOINT = 'https://orz.xiaogenban.deno.net/mcp';
+    let cachedMcpTools = null;
+
     function switchTab(tab) {
       document.getElementById('panel-openai').style.display = tab === 'openai' ? '' : 'none';
+      document.getElementById('panel-openai-mcp').style.display = tab === 'openai-mcp' ? '' : 'none';
       document.getElementById('panel-claude').style.display = tab === 'claude' ? '' : 'none';
       document.getElementById('tab-openai').className = 'tab' + (tab === 'openai' ? ' active' : '');
+      document.getElementById('tab-openai-mcp').className = 'tab' + (tab === 'openai-mcp' ? ' active' : '');
       document.getElementById('tab-claude').className = 'tab' + (tab === 'claude' ? ' active' : '');
+    }
+
+    function safeJsonParse(value, fallback) {
+      if (typeof value !== 'string') return fallback;
+      try { return JSON.parse(value); } catch { return fallback; }
+    }
+
+    function safeStringify(value) {
+      try { return JSON.stringify(value); } catch { return String(value); }
+    }
+
+    function addCitation(citations, seen, url, title) {
+      if (url && !seen.has(url)) {
+        seen.add(url);
+        citations.push({ url, title: title || url });
+      }
+    }
+
+    function collectResponseCitations(resp, citations, seen) {
+      for (const item of (resp.output || [])) {
+        if (item.type !== 'message') continue;
+        for (const c of (item.content || [])) {
+          if (c.type !== 'output_text') continue;
+          for (const ann of (c.annotations || [])) {
+            if (ann.type === 'url_citation') {
+              addCitation(citations, seen, ann.url, ann.title || ann.url);
+            }
+          }
+        }
+      }
+    }
+
+    function extractResponseText(resp) {
+      if (typeof resp.output_text === 'string' && resp.output_text.trim()) {
+        return resp.output_text.trim();
+      }
+      let text = '';
+      for (const item of (resp.output || [])) {
+        if (item.type !== 'message') continue;
+        for (const c of (item.content || [])) {
+          if (c.type === 'output_text' && c.text) text += c.text;
+        }
+      }
+      return text.trim();
+    }
+
+    function renderCitations(citations, citationList, citationsEl) {
+      if (citations.length === 0) {
+        citationsEl.style.display = 'none';
+        return;
+      }
+      citationList.innerHTML = citations.map((c, i) => `
+        <div class="citation-item">
+          <span class="citation-num">${i + 1}</span>
+          <div>
+            <a class="citation-link" href="${c.url}" target="_blank">${c.url}</a>
+            <div class="citation-title">${c.title}</div>
+          </div>
+        </div>
+      `).join('');
+      citationsEl.style.display = 'block';
+    }
+
+    function renderMcpOutput(resultEl, toolLogs, answerText) {
+      const lines = [];
+      if (toolLogs.length > 0) {
+        lines.push('[工具调用记录]');
+        toolLogs.forEach((log, i) => {
+          lines.push(`${i + 1}. ${log.name} ${safeStringify(log.args)}`);
+        });
+        lines.push('');
+      }
+      lines.push('[模型回复]');
+      lines.push(answerText || '（模型未返回文本）');
+      resultEl.textContent = lines.join('\n');
+    }
+
+    function parseMcpPayloads(raw) {
+      const text = (raw || '').trim();
+      if (!text) return [];
+
+      if (text[0] === '{' || text[0] === '[') {
+        try {
+          const parsed = JSON.parse(text);
+          return Array.isArray(parsed) ? parsed : [parsed];
+        } catch {}
+      }
+
+      const payloads = [];
+      const blocks = text.split(/\r?\n\r?\n/);
+      for (const block of blocks) {
+        const dataLines = [];
+        for (const line of block.split(/\r?\n/)) {
+          if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+        }
+        if (dataLines.length === 0) continue;
+        const joined = dataLines.join('\n').trim();
+        if (!joined || joined === '[DONE]') continue;
+        try { payloads.push(JSON.parse(joined)); } catch {}
+      }
+      if (payloads.length > 0) return payloads;
+
+      const lines = text.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const body = line.slice(5).trim();
+        if (!body || body === '[DONE]') continue;
+        try { payloads.push(JSON.parse(body)); } catch {}
+      }
+      return payloads;
+    }
+
+    async function mcpJsonRpc(method, params) {
+      const body = {
+        jsonrpc: '2.0',
+        id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        method,
+        params: params || {}
+      };
+
+      const res = await fetch(MCP_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream'
+        },
+        body: JSON.stringify(body)
+      });
+
+      const raw = await res.text();
+      const payloads = parseMcpPayloads(raw);
+      const payload = [...payloads].reverse().find(p => p && (Object.prototype.hasOwnProperty.call(p, 'result') || Object.prototype.hasOwnProperty.call(p, 'error')))
+        || payloads[payloads.length - 1]
+        || null;
+
+      if (!res.ok) {
+        throw new Error(payload?.error?.message || `MCP HTTP ${res.status}`);
+      }
+      if (!payload) throw new Error('MCP 返回格式无法解析');
+      if (payload.error) throw new Error(payload.error.message || 'MCP 调用失败');
+      if (!Object.prototype.hasOwnProperty.call(payload, 'result')) {
+        throw new Error('MCP 调用返回为空');
+      }
+      return payload.result;
+    }
+
+    async function callResponsesApiStream(baseUrl, apiKey, body, onEvent) {
+      const res = await fetch(`${baseUrl}/v1/responses`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {})
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error?.message || `HTTP ${res.status}`);
+      }
+
+      const reader = res.body?.getReader?.();
+      if (!reader) {
+        throw new Error('流式响应不可用');
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let completedResponse = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (!raw || raw === '[DONE]') continue;
+
+          let evt;
+          try { evt = JSON.parse(raw); } catch { continue; }
+          if (onEvent) onEvent(evt);
+
+          if (evt.type === 'response.completed') {
+            completedResponse = evt.response || completedResponse;
+          } else if (evt.type === 'response.failed') {
+            throw new Error(evt.response?.error?.message || '响应失败');
+          }
+        }
+      }
+
+      if (!completedResponse) {
+        throw new Error('流式响应未返回 response.completed');
+      }
+      return completedResponse;
+    }
+
+    function getDefaultMcpTools() {
+      return {
+        web_search: {
+          description: 'Search the web using multiple search engines (Brave, Sogou, DuckDuckGo) simultaneously. Results are deduplicated and ads are filtered out.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'Search keywords separated by spaces.' },
+              num_results: { type: 'number', description: 'Number of results to return (default: 8)', default: 8 }
+            },
+            required: ['query']
+          }
+        },
+        web_fetch: {
+          description: 'Fetch a web page and return its content. simplify=true will extract main content and convert it to Markdown.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              url: { type: 'string', description: 'The URL to fetch' },
+              max_char_size: { type: 'number', description: 'Maximum character size (default: 50000)', default: 50000 },
+              simplify: { type: 'boolean', description: 'Whether to simplify page content (default: true)', default: true }
+            },
+            required: ['url']
+          }
+        }
+      };
+    }
+
+    async function getMcpTools() {
+      if (cachedMcpTools) return cachedMcpTools;
+      try {
+        const result = await mcpJsonRpc('tools/list', {});
+        const map = {};
+        for (const tool of (result.tools || [])) map[tool.name] = tool;
+        if (map.web_search && map.web_fetch) {
+          cachedMcpTools = map;
+          return cachedMcpTools;
+        }
+      } catch (err) {
+        console.warn('MCP tools/list failed, fallback to default tool schema:', err);
+      }
+      cachedMcpTools = getDefaultMcpTools();
+      return cachedMcpTools;
+    }
+
+    function buildOpenAIMcpTools(toolMap) {
+      const defaults = getDefaultMcpTools();
+      const search = toolMap.web_search || defaults.web_search;
+      const fetchTool = toolMap.web_fetch || defaults.web_fetch;
+      return [
+        {
+          type: 'function',
+          name: 'mcp_org_web_search',
+          description: search.description,
+          parameters: search.inputSchema
+        },
+        {
+          type: 'function',
+          name: 'mcp_org_web_fetch',
+          description: fetchTool.description,
+          parameters: fetchTool.inputSchema
+        }
+      ];
+    }
+
+    function parseToolArgs(args) {
+      if (!args) return {};
+      if (typeof args === 'string') return safeJsonParse(args, { raw: args });
+      if (typeof args === 'object') return args;
+      return {};
+    }
+
+    function normalizeMcpToolArgs(aliasName, args) {
+      const source = (args && typeof args === 'object') ? args : {};
+
+      if (aliasName === 'mcp_org_web_search') {
+        const query =
+          (typeof source.query === 'string' && source.query.trim()) ||
+          (typeof source.q === 'string' && source.q.trim()) ||
+          (Array.isArray(source.queries) ? String(source.queries.find(v => typeof v === 'string' && v.trim()) || '').trim() : '') ||
+          (typeof source.keyword === 'string' && source.keyword.trim()) ||
+          '';
+
+        if (!query) throw new Error('mcp_org_web_search 缺少 query 参数');
+
+        const normalized = { query };
+        const numResults = Number(source.num_results ?? source.max_results ?? source.top_k);
+        if (Number.isFinite(numResults) && numResults > 0) {
+          normalized.num_results = Math.min(20, Math.floor(numResults));
+        }
+        return normalized;
+      }
+
+      if (aliasName === 'mcp_org_web_fetch') {
+        const url =
+          (typeof source.url === 'string' && source.url.trim()) ||
+          (typeof source.link === 'string' && source.link.trim()) ||
+          (typeof source.uri === 'string' && source.uri.trim()) ||
+          '';
+
+        if (!url) throw new Error('mcp_org_web_fetch 缺少 url 参数');
+
+        const normalized = { url };
+        const maxCharSize = Number(source.max_char_size ?? source.max_chars ?? source.max_length);
+        if (Number.isFinite(maxCharSize) && maxCharSize > 0) {
+          normalized.max_char_size = Math.floor(maxCharSize);
+        }
+        if (typeof source.simplify === 'boolean') {
+          normalized.simplify = source.simplify;
+        }
+        return normalized;
+      }
+
+      return source;
+    }
+
+    async function callMcpToolByAlias(aliasName, args) {
+      const mcpToolName = aliasName === 'mcp_org_web_search'
+        ? 'web_search'
+        : aliasName === 'mcp_org_web_fetch'
+          ? 'web_fetch'
+          : '';
+
+      if (!mcpToolName) {
+        throw new Error(`未知工具: ${aliasName}`);
+      }
+
+      return mcpJsonRpc('tools/call', {
+        name: mcpToolName,
+        arguments: args || {}
+      });
+    }
+
+    function collectCitationsFromMcpSearch(result, citations, seen) {
+      for (const block of (result.content || [])) {
+        if (block.type !== 'text' || !block.text) continue;
+        const rows = safeJsonParse(block.text, []);
+        if (!Array.isArray(rows)) continue;
+        for (const row of rows) {
+          addCitation(citations, seen, row.url || row.link, row.title || row.url || row.link);
+        }
+      }
+    }
+
+    function getMessageItemsFromResponse(outputItems) {
+      const items = [];
+      for (const item of (outputItems || [])) {
+        if (!item || typeof item !== 'object') continue;
+        if (item.type !== 'message') continue;
+        items.push({
+          type: 'message',
+          role: item.role || 'assistant',
+          content: item.content || []
+        });
+      }
+      return items;
+    }
+
+    async function doOpenAIMcpSearch() {
+      const query = document.getElementById('mcpQuery').value.trim();
+      const btn = document.getElementById('mcpSearchBtn');
+      const status = document.getElementById('mcpStatus');
+      const errorBox = document.getElementById('mcpErrorBox');
+      const resultBox = document.getElementById('mcpResultBox');
+      const requestBox = document.getElementById('mcpRequestBox');
+      const responseBox = document.getElementById('mcpResponseBox');
+      const resultText = document.getElementById('mcpResultText');
+      const citationsEl = document.getElementById('mcpCitations');
+      const citationList = document.getElementById('mcpCitationList');
+
+      if (!query) { showMcpError('请输入搜索问题'); return; }
+
+      const baseUrl = document.getElementById('baseUrl').value.trim().replace(/\/$/, '');
+      const apiKey = document.getElementById('apiKey').value.trim();
+
+      errorBox.className = 'error-box';
+      resultBox.className = 'result-box';
+      requestBox.className = 'request-box';
+      responseBox.className = 'request-box';
+      resultText.textContent = '';
+      citationsEl.style.display = 'none';
+      citationList.innerHTML = '';
+
+      btn.disabled = true;
+      status.innerHTML = '<span class="spinner"></span>连接中...';
+
+      let finalModel = 'gpt-5-nano';
+      let finalAnswer = '';
+      const requestHistory = [];
+      const responseHistory = [];
+      const toolLogs = [];
+      const citations = [];
+      const seenCitations = new Set();
+
+      try {
+        const toolMap = await getMcpTools();
+        const openAITools = buildOpenAIMcpTools(toolMap);
+        let inputPayload = [{ role: 'user', content: query }];
+        const maxRounds = 8;
+
+        resultBox.className = 'result-box visible';
+
+        for (let round = 1; round <= maxRounds; round++) {
+          const body = {
+            model: 'gpt-5-nano',
+            tools: openAITools,
+            stream: true,
+            input: inputPayload
+          };
+
+          requestHistory.push({ round, body });
+          document.getElementById('mcpRequestBody').textContent = JSON.stringify(requestHistory, null, 2);
+          requestBox.className = 'request-box visible';
+
+          status.innerHTML = `<span class="spinner"></span>第${round}轮处理中...`;
+          let sawTextDeltaThisRound = false;
+
+          const resp = await callResponsesApiStream(baseUrl, apiKey, body, evt => {
+            const type = evt.type || '';
+            if (type === 'response.output_item.added') {
+              const item = evt.item || {};
+              if (item.type === 'function_call') {
+                status.innerHTML = `<span class="spinner"></span>第${round}轮等待工具...`;
+              } else if (item.type === 'message') {
+                status.innerHTML = `<span class="spinner"></span>第${round}轮生成回答中...`;
+              }
+            } else if (type === 'response.output_text.delta') {
+              sawTextDeltaThisRound = true;
+              finalAnswer += evt.delta || '';
+              renderMcpOutput(resultText, toolLogs, finalAnswer);
+            }
+          });
+          responseHistory.push({ round, response: resp });
+          document.getElementById('mcpResponseBody').textContent = JSON.stringify(responseHistory, null, 2);
+          responseBox.className = 'request-box visible';
+
+          finalModel = resp.model || finalModel;
+
+          collectResponseCitations(resp, citations, seenCitations);
+          const text = extractResponseText(resp);
+          if (text && !sawTextDeltaThisRound) {
+            finalAnswer = text;
+            renderMcpOutput(resultText, toolLogs, finalAnswer);
+          }
+
+          const messageItems = getMessageItemsFromResponse(resp.output);
+          if (messageItems.length > 0) {
+            inputPayload = inputPayload.concat(messageItems);
+          }
+
+          const functionCalls = (resp.output || []).filter(item => item.type === 'function_call');
+          if (functionCalls.length === 0) break;
+
+          const toolOutputs = [];
+          const preparedCalls = functionCalls.map((call, idx) => {
+            const toolName = call.name || '';
+            const args = normalizeMcpToolArgs(toolName, parseToolArgs(call.arguments));
+            const callId = call.call_id || `call_${round}_${idx}`;
+            const argumentsText = typeof call.arguments === 'string' ? call.arguments : safeStringify(args);
+            toolLogs.push({ name: toolName, args });
+            return { toolName, args, callId, argumentsText };
+          });
+          renderMcpOutput(resultText, toolLogs, finalAnswer);
+
+          status.innerHTML = `<span class="spinner"></span>第${round}轮并行调用 ${preparedCalls.length} 个工具...`;
+
+          const callResults = await Promise.all(preparedCalls.map(async entry => {
+            const mcpResult = await callMcpToolByAlias(entry.toolName, entry.args);
+            return { ...entry, mcpResult };
+          }));
+
+          for (const entry of callResults) {
+            if (entry.toolName === 'mcp_org_web_search') {
+              collectCitationsFromMcpSearch(entry.mcpResult, citations, seenCitations);
+            } else if (entry.toolName === 'mcp_org_web_fetch') {
+              addCitation(citations, seenCitations, entry.args.url, entry.args.url);
+            }
+
+            toolOutputs.push({
+              type: 'function_call',
+              call_id: entry.callId,
+              name: entry.toolName,
+              arguments: entry.argumentsText,
+              status: 'completed'
+            });
+            toolOutputs.push({
+              type: 'function_call_output',
+              call_id: entry.callId,
+              output: safeStringify(entry.mcpResult)
+            });
+          }
+          if (round === maxRounds) throw new Error('工具调用轮次超过上限，请缩小问题后重试');
+          inputPayload = inputPayload.concat(toolOutputs);
+        }
+        renderMcpOutput(resultText, toolLogs, finalAnswer);
+
+        renderCitations(citations, citationList, citationsEl);
+        status.textContent = `完成 · 模型: ${finalModel}`;
+
+      } catch (err) {
+        showMcpError(err.message);
+        status.textContent = '';
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function showMcpError(msg) {
+      const box = document.getElementById('mcpErrorBox');
+      box.textContent = msg;
+      box.className = 'error-box visible';
     }
 
     async function doClaudeSearch() {
@@ -387,12 +933,7 @@
         let buffer = '';
         const citations = [];
         const seen = new Set();
-        const blockNames = {};
         const allEvents = [];
-
-        const addCitation = (url, title) => {
-          if (url && !seen.has(url)) { seen.add(url); citations.push({ url, title: title || url }); }
-        };
 
         while (true) {
           const { done, value } = await reader.read();
@@ -417,17 +958,14 @@
 
             if (type === 'content_block_start') {
               const block = evt.content_block || {};
-              const idx = evt.index;
               if (block.type === 'server_tool_use') {
-                blockNames[idx] = block.name;
                 if (block.name === 'web_search') status.innerHTML = '<span class="spinner"></span>正在搜索网络...';
                 else if (block.name === 'web_fetch') status.innerHTML = '<span class="spinner"></span>正在获取页面...';
               } else if (block.type === 'text') {
                 status.innerHTML = '<span class="spinner"></span>生成回答中...';
               } else if (block.type === 'server_tool_result' || block.type === 'web_search_tool_result') {
-                // results may be inline in content_block_start
                 for (const r of (block.content || block.results || [])) {
-                  addCitation(r.url || r.link, r.title);
+                  addCitation(citations, seen, r.url || r.link, r.title);
                 }
               }
             }
@@ -437,27 +975,11 @@
               if (delta.type === 'text_delta') {
                 resultText.textContent += delta.text || '';
               }
-              // some proxies stream search results as json_delta on server_tool_result blocks
-              if (delta.type === 'input_json_delta' || delta.type === 'json_delta') {
-                // accumulate per-block if needed — skip for now
-              }
             }
           }
         }
 
-        if (citations.length > 0) {
-          citationList.innerHTML = citations.map((c, i) => `
-            <div class="citation-item">
-              <span class="citation-num">${i + 1}</span>
-              <div>
-                <a class="citation-link" href="${c.url}" target="_blank">${c.url}</a>
-                <div class="citation-title">${c.title}</div>
-              </div>
-            </div>
-          `).join('');
-          citationsEl.style.display = 'block';
-        }
-
+        renderCitations(citations, citationList, citationsEl);
         status.textContent = `完成 · 模型: ${finalModel}`;
 
         const claudeResponseBox = document.getElementById('claudeResponseBox');
@@ -543,7 +1065,7 @@
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
-          buffer = lines.pop(); // keep incomplete line
+          buffer = lines.pop();
 
           for (const line of lines) {
             if (!line.startsWith('data: ')) continue;
@@ -579,7 +1101,6 @@
 
               for (const item of (resp.output || [])) {
                 if (item.type === 'web_search_call') {
-                  // collect search queries as fallback
                   const q = item.action?.query || (item.action?.queries || [])[0];
                   if (q) queries.push(q);
                 }
@@ -587,9 +1108,8 @@
                   for (const c of (item.content || [])) {
                     if (c.type === 'output_text') {
                       for (const ann of (c.annotations || [])) {
-                        if (ann.type === 'url_citation' && !seen.has(ann.url)) {
-                          seen.add(ann.url);
-                          citations.push({ url: ann.url, title: ann.title || ann.url });
+                        if (ann.type === 'url_citation') {
+                          addCitation(citations, seen, ann.url, ann.title || ann.url);
                         }
                       }
                     }
@@ -598,16 +1118,7 @@
               }
 
               if (citations.length > 0) {
-                citationList.innerHTML = citations.map((c, i) => `
-                  <div class="citation-item">
-                    <span class="citation-num">${i + 1}</span>
-                    <div>
-                      <a class="citation-link" href="${c.url}" target="_blank">${c.url}</a>
-                      <div class="citation-title">${c.title}</div>
-                    </div>
-                  </div>
-                `).join('');
-                citationsEl.style.display = 'block';
+                renderCitations(citations, citationList, citationsEl);
               } else if (queries.length > 0) {
                 citationList.innerHTML = queries.map((q, i) => `
                   <div class="citation-item">
@@ -641,6 +1152,9 @@
 
     document.getElementById('query').addEventListener('keydown', e => {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doSearch();
+    });
+    document.getElementById('mcpQuery').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doOpenAIMcpSearch();
     });
     document.getElementById('claudeQuery').addEventListener('keydown', e => {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doClaudeSearch();
