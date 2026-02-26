@@ -250,7 +250,7 @@
 
     <div class="tabs">
       <button class="tab active" id="tab-openai" onclick="switchTab('openai')">OpenAI <span class="model-badge" style="margin-left:6px">gpt-5-nano</span></button>
-      <button class="tab" id="tab-claude" onclick="switchTab('claude')">Claude <span class="model-badge" style="margin-left:6px;background:#1e2d3d;color:#7ab8f5">claude-sonnet-4-6</span></button>
+      <button class="tab" id="tab-claude" onclick="switchTab('claude')">Claude <span class="model-badge" style="margin-left:6px;background:#1e2d3d;color:#7ab8f5">claude-haiku-4-5-20251001</span></button>
     </div>
 
     <!-- OpenAI panel -->
@@ -348,13 +348,13 @@
         { type: 'web_search_20250305', name: 'web_search' },
         { type: 'web_fetch_20250910', name: 'web_fetch' }
       ];
-      let finalModel = 'claude-sonnet-4-6';
+      let finalModel = 'claude-haiku-4-5-20251001';
 
       try {
         resultBox.className = 'result-box visible';
 
         const body = {
-          model: 'claude-sonnet-4-6',
+          model: 'claude-haiku-4-5-20251001',
           max_tokens: 2048,
           stream: true,
           tools,
